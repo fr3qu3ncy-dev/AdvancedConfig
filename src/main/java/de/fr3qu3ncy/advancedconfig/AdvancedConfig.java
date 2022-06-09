@@ -1,9 +1,9 @@
 package de.fr3qu3ncy.advancedconfig;
 
-import de.fr3qu3ncy.advancedconfig.annotation.Comment;
 import de.fr3qu3ncy.advancedconfig.annotation.Config;
 import de.fr3qu3ncy.advancedconfig.serialization.ConfigParser;
-import lombok.RequiredArgsConstructor;
+import lombok.AccessLevel;
+import lombok.Getter;
 import lombok.SneakyThrows;
 import org.apache.commons.io.FileUtils;
 import org.bukkit.configuration.ConfigurationSection;
@@ -18,14 +18,15 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
-@RequiredArgsConstructor
 public class AdvancedConfig {
 
-    private final Map<Class<?>, ConfigParser<?>> configParsers = new HashMap<>();
-    private final List<Class<?>> configClasses = new ArrayList<>();
-
     private static final String COMMENT_IDENTIFIER = "_COMMENT_";
+
+    @Getter(AccessLevel.PACKAGE)
+    private static final Map<Class<?>, ConfigParser<?>> configParsers = new HashMap<>();
+    private final List<Class<?>> configClasses = new ArrayList<>();
 
     private final Plugin plugin;
     private final String filePath;
@@ -33,6 +34,16 @@ public class AdvancedConfig {
 
     private File configFile;
     private YamlConfiguration config;
+
+    public AdvancedConfig(Plugin plugin, String filePath, String fileName) {
+        this.plugin = plugin;
+        this.filePath = filePath;
+        this.fileName = fileName;
+    }
+
+    public AdvancedConfig(Plugin plugin, String fileName) {
+        this(plugin, null, fileName);
+    }
 
     /**
      * Register a class containing configuration values
@@ -51,12 +62,18 @@ public class AdvancedConfig {
      * @param clazz  The class to parse
      * @param parser The parser
      */
-    public <T> void registerConfigParser(Class<T> clazz, ConfigParser<T> parser) {
+    public static <T> void registerConfigParser(Class<T> clazz, ConfigParser<T> parser) {
         configParsers.put(clazz, parser);
     }
 
+    public static <T> void registerConfigParser(Class<T> clazz, Supplier<ConfigParser<T>> parser) {
+        configParsers.put(clazz, parser.get());
+    }
+
     private File getFileDirectory() {
-        return new File(plugin.getDataFolder().getAbsolutePath(), filePath);
+        return filePath != null
+            ? new File(plugin.getDataFolder().getAbsolutePath(), filePath)
+            : new File(plugin.getDataFolder().getAbsolutePath());
     }
 
     /**
@@ -100,58 +117,79 @@ public class AdvancedConfig {
     /**
      * Loads all registered Config classes
      */
-    public void loadConfiguration() throws IllegalAccessException, IOException {
+    @SneakyThrows
+    public void loadConfiguration() {
         //Loop all config
+        if (!configClasses.isEmpty()) {
+            //Call getConfig here to create all needed files
+            getConfig();
+        }
         for (Class<?> clazz : configClasses) {
             for (Field field : clazz.getFields()) {
 
+                //Field needs to be public static and be annotated with Config
                 if (!field.isAnnotationPresent(Config.class) || !Modifier.isStatic(field.getModifiers())) {
                     continue;
                 }
 
-                //Call getConfig here to create all needed files
-                getConfig();
-
-                Config data = field.getAnnotation(Config.class);
-                String path = data.value();
-                ConfigurationSection section = config.getConfigurationSection(path);
-
-                String comment = null;
-                if (field.isAnnotationPresent(Comment.class)) {
-                    comment = field.getAnnotation(Comment.class).value();
-                }
-
-                //Get the specified default value
-                Object defaultValue = field.get(null);
-
-                //Check if there is a parser for specified type
-                Class<?> type = field.getType();
-                ConfigParser<?> parser = configParsers.get(type);
-
-                if (!config.contains(path) && defaultValue != null) {
-                    applyDefaultValue(parser, comment, path, defaultValue);
-                } else {
-                    writeToField(section, field, parser, path, defaultValue);
-                }
+                new ConfigField(this, field).load();
             }
         }
         replaceComments();
     }
 
+    public static <T> T deserialize(Class<T> clazz, ConfigurationSection section) {
+        ConfigParser<?> parser = configParsers.get(clazz);
+        if (parser == null) return null;
+        return (T) parser.deserialize(section);
+    }
+
+    public static <T> void serialize(ConfigurationSection section, Class<T> clazz, T object) {
+        ConfigParser<T> parser = configParsers.containsKey(clazz) ? (ConfigParser<T>) configParsers.get(clazz) : null;
+        if (parser == null) return;
+        parser.serialize(section, object);
+    }
+
+    protected void applyDefaultValue(ConfigField field) {
+        ConfigParser<?> parser = field.getParser();
+        String path = field.getPath();
+        String comment = field.getComment();
+        Object defaultValue = field.getDefaultValue();
+
+        if (parser != null) {
+            ConfigurationSection section = config.createSection(path);
+            if (comment != null) {
+                config.set(section.getCurrentPath() + COMMENT_IDENTIFIER, comment);
+            }
+            applyDefault(section, parser, defaultValue);
+        } else {
+            if (comment != null) {
+                config.set(path + COMMENT_IDENTIFIER, comment);
+            }
+            config.set(path, defaultValue);
+        }
+        saveConfig();
+    }
+
+    @SuppressWarnings("unchecked")
+    protected  <T> void applyDefault(ConfigurationSection section, ConfigParser<T> parser, Object object) {
+        parser.serialize(section, (T) object);
+    }
+
     @SuppressWarnings("java:S3011")
     @SneakyThrows
-    private void writeToField(ConfigurationSection section, Field field, ConfigParser<?> parser,
-                              String path, Object defaultValue) {
+    protected void writeToField(ConfigurationSection section, ConfigField field) {
         Object value;
-        if (parser != null) {
-            value = parser.deserialize(section);
+        if (field.getParser() != null) {
+            value = field.getParser().deserialize(section);
         } else {
-            value = getConfig().get(path, defaultValue);
+            value = getConfig().get(field.getPath(), field.getDefaultValue());
         }
-        field.set(null, value);
+        field.getField().set(null, value);
     }
 
     private void replaceComments() throws IOException {
+        if (configFile == null) return;
         File oldConfig = new File(getFileDirectory(), fileName + ".old.yml");
         if (!oldConfig.exists() && !oldConfig.createNewFile()) return;
         FileUtils.copyFile(configFile, oldConfig);
@@ -189,27 +227,6 @@ public class AdvancedConfig {
             }
         }
         writer.write(line + "\n");
-    }
-
-    private void applyDefaultValue(ConfigParser<?> parser, String comment, String path, Object defaultValue) {
-        if (parser != null) {
-            ConfigurationSection section = config.createSection(path);
-            if (comment != null) {
-                config.set(section.getCurrentPath() + COMMENT_IDENTIFIER, comment);
-            }
-            applyDefault(section, parser, defaultValue);
-        } else {
-            if (comment != null) {
-                config.set(path + COMMENT_IDENTIFIER, comment);
-            }
-            config.set(path, defaultValue);
-        }
-        saveConfig();
-    }
-
-    @SuppressWarnings("unchecked")
-    private <T> void applyDefault(ConfigurationSection section, ConfigParser<T> parser, Object object) {
-        parser.serialize(section, (T) object);
     }
 
     @SneakyThrows
